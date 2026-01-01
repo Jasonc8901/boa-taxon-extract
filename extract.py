@@ -4,7 +4,7 @@ Zero-third-party scraper for Butterflies of America US/Canada images page.
 
 XLSX output (stdlib only) with columns:
   Species      -> "Genus species"
-  Subspecies   -> subspecies epithet (last word of trinomial); nominate uses species epithet
+  Subspecies   -> subspecies epithet (last word of trinomial); blank if none
   Common Name  -> pulled from <i id="e">...</i> on the species row; carried to its subspecies rows
 """
 
@@ -31,32 +31,28 @@ class BOAHTMLParser(HTMLParser):
     """
     Extract:
       - species/subspecies taxon names from <a title="species thumbnails"> / <a title="subspecies thumbnails">
-      - common name from <i id="e">...</i> in the species paragraph
+      - common name from <i id="e">...</i> in the species paragraph (<p id="p9">)
     """
     def __init__(self) -> None:
         super().__init__()
         self.items: List[TaxonItem] = []
         self.species_common: dict[str, str] = {}
 
-        # anchor capture
         self._capture_anchor_kind: Optional[str] = None
         self._anchor_buf: List[str] = []
 
-        # common-name capture
         self._capture_common: bool = False
         self._common_buf: List[str] = []
 
-        # context: are we inside the species paragraph (<p id="p9">)?
         self._in_species_p: bool = False
-        self._last_species_in_p: Optional[str] = None  # normalized species last seen within current p9
+        self._last_species_in_p: Optional[str] = None
 
     def handle_starttag(self, tag: str, attrs) -> None:
         t = tag.lower()
         attrs_dict = {k.lower(): (v or "") for k, v in attrs}
 
         if t == "p":
-            pid = attrs_dict.get("id", "")
-            if pid == "p9":
+            if attrs_dict.get("id", "") == "p9":
                 self._in_species_p = True
                 self._last_species_in_p = None
 
@@ -70,7 +66,6 @@ class BOAHTMLParser(HTMLParser):
                 self._anchor_buf = []
 
         if t == "i":
-            # common name appears as <i id="e">Common Name</i>
             if attrs_dict.get("id", "") == "e" and self._in_species_p:
                 self._capture_common = True
                 self._common_buf = []
@@ -90,13 +85,11 @@ class BOAHTMLParser(HTMLParser):
         if t == "i" and self._capture_common:
             common = " ".join("".join(self._common_buf).split())
             if common and self._last_species_in_p:
-                # associate common name to the species that appeared in this species paragraph
                 self.species_common[self._last_species_in_p] = common
             self._capture_common = False
             self._common_buf = []
 
         if t == "p" and self._in_species_p:
-            # leaving the species paragraph
             self._in_species_p = False
             self._last_species_in_p = None
 
@@ -128,11 +121,6 @@ def normalize_species(taxon_text: str) -> str:
     return taxon_text.strip()
 
 
-def species_epithet(species_binomial: str) -> str:
-    parts = species_binomial.split()
-    return parts[1] if len(parts) >= 2 else ""
-
-
 def subspecies_epithet_only(trinomial_text: str) -> str:
     parts = trinomial_text.split()
     return parts[-1] if parts else ""
@@ -141,9 +129,9 @@ def subspecies_epithet_only(trinomial_text: str) -> str:
 def build_rows(items: List[TaxonItem], species_common: dict[str, str]) -> List[Tuple[str, str, str]]:
     """
     Build rows enforcing:
-      - no species-only rows
-      - nominate output if a species has no subspecies
-      - include common name column (from the species row; carried to subspecies rows)
+      - no species-only header rows
+      - if no subspecies exist for a species, output a single row with blank subspecies
+      - include common name (from the species row; carried to subspecies rows)
     """
     rows: List[Tuple[str, str, str]] = []
 
@@ -151,22 +139,22 @@ def build_rows(items: List[TaxonItem], species_common: dict[str, str]) -> List[T
     current_common: str = ""
     current_species_had_subspecies: bool = False
 
-    def flush_nominate_if_needed() -> None:
+    def flush_blank_if_needed() -> None:
         nonlocal current_species, current_species_had_subspecies, current_common, rows
         if current_species and not current_species_had_subspecies:
-            rows.append((current_species, species_epithet(current_species), current_common))
+            rows.append((current_species, "", current_common))
 
     for it in items:
         if it.kind == "species":
             # Species boundary: flush prior species if it never got a subspecies
-            flush_nominate_if_needed()
+            flush_blank_if_needed()
 
             current_species = normalize_species(it.taxon)
             current_common = species_common.get(current_species, "")
             current_species_had_subspecies = False
 
         elif it.kind == "subspecies":
-            # If no prior species captured (edge case), infer from first two words
+            # Edge case: subspecies before any species
             if not current_species:
                 current_species = normalize_species(it.taxon)
                 current_common = species_common.get(current_species, "")
@@ -175,7 +163,7 @@ def build_rows(items: List[TaxonItem], species_common: dict[str, str]) -> List[T
             rows.append((current_species, subspecies_epithet_only(it.taxon), current_common))
 
     # Flush last species if needed
-    flush_nominate_if_needed()
+    flush_blank_if_needed()
 
     # De-duplicate exact repeats while preserving order
     seen = set()
