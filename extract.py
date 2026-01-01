@@ -4,12 +4,13 @@ Zero-third-party scraper for Butterflies of America US/Canada images page.
 
 XLSX output (stdlib only) with columns:
   Species      -> "Genus species"
-  Subspecies   -> subspecies epithet (last word of trinomial); blank if none
-  Common Name  -> pulled from <i id="e">...</i> on the species row; carried to its subspecies rows
+  Subspecies   -> last word of trinomial; blank if none
+  Common Name  -> from <i id="e">...</i> on the species row; carried to its subspecies rows
 """
 
 from __future__ import annotations
 
+import re
 import sys
 import urllib.request
 import zipfile
@@ -20,82 +21,107 @@ from xml.sax.saxutils import escape as xml_escape
 
 DEFAULT_URL = "https://www.butterfliesofamerica.com/US-Can-images.htm"
 
+# Accepts "Genus species" or "Genus species subspecies"
+TAXON_RE = re.compile(r"^([A-Z][a-z]+)\s+([a-z][a-z\-]*)(?:\s+([a-z][a-z\-]*))?$")
+
 
 @dataclass(frozen=True)
 class TaxonItem:
     kind: str   # "species" | "subspecies"
-    taxon: str  # e.g. "Eurytides phaon" or "Eurytides phaon phaon"
+    taxon: str  # e.g. "Microtia elvira" or "Eurytides phaon phaon"
 
 
 class BOAHTMLParser(HTMLParser):
     """
-    Extract:
-      - species/subspecies taxon names from <a title="species thumbnails"> / <a title="subspecies thumbnails">
-      - common name from <i id="e">...</i> in the species paragraph (<p id="p9">)
+    Robust extraction:
+      - While inside <p id="p9"> (species) or <p id="p9s"> (subspecies), capture ANY <a> text
+        that matches TAXON_RE. This avoids relying on the <a title="..."> attribute.
+      - Common name is <i id="e">...</i> inside the species paragraph <p id="p9">.
     """
     def __init__(self) -> None:
         super().__init__()
         self.items: List[TaxonItem] = []
         self.species_common: dict[str, str] = {}
 
-        self._capture_anchor_kind: Optional[str] = None
-        self._anchor_buf: List[str] = []
+        # Context flags
+        self._in_p9: bool = False
+        self._in_p9s: bool = False
 
+        # Anchor capture (only within p9/p9s)
+        self._capture_a: bool = False
+        self._a_buf: List[str] = []
+
+        # Common name capture (only within p9)
         self._capture_common: bool = False
         self._common_buf: List[str] = []
 
-        self._in_species_p: bool = False
-        self._last_species_in_p: Optional[str] = None
+        # Track last species taxon seen within the current p9 to map the common name
+        self._last_species_in_p9: Optional[str] = None
 
     def handle_starttag(self, tag: str, attrs) -> None:
         t = tag.lower()
         attrs_dict = {k.lower(): (v or "") for k, v in attrs}
 
         if t == "p":
-            if attrs_dict.get("id", "") == "p9":
-                self._in_species_p = True
-                self._last_species_in_p = None
+            pid = attrs_dict.get("id", "")
+            if pid == "p9":
+                self._in_p9 = True
+                self._in_p9s = False
+                self._last_species_in_p9 = None
+            elif pid == "p9s":
+                self._in_p9s = True
+                self._in_p9 = False
 
-        if t == "a":
-            title = attrs_dict.get("title", "").strip().lower()
-            if title == "species thumbnails":
-                self._capture_anchor_kind = "species"
-                self._anchor_buf = []
-            elif title == "subspecies thumbnails":
-                self._capture_anchor_kind = "subspecies"
-                self._anchor_buf = []
+        # Capture any <a> text inside the relevant <p>
+        if t == "a" and (self._in_p9 or self._in_p9s):
+            self._capture_a = True
+            self._a_buf = []
 
-        if t == "i":
-            if attrs_dict.get("id", "") == "e" and self._in_species_p:
-                self._capture_common = True
-                self._common_buf = []
+        # Capture common name: <i id="e">Common Name</i> inside p9
+        if t == "i" and self._in_p9 and attrs_dict.get("id", "") == "e":
+            self._capture_common = True
+            self._common_buf = []
 
     def handle_endtag(self, tag: str) -> None:
         t = tag.lower()
 
-        if t == "a" and self._capture_anchor_kind:
-            taxon = " ".join("".join(self._anchor_buf).split())
-            if taxon:
-                self.items.append(TaxonItem(self._capture_anchor_kind, taxon))
-                if self._capture_anchor_kind == "species" and self._in_species_p:
-                    self._last_species_in_p = normalize_species(taxon)
-            self._capture_anchor_kind = None
-            self._anchor_buf = []
+        if t == "a" and self._capture_a:
+            text = " ".join("".join(self._a_buf).split())
+            self._capture_a = False
+            self._a_buf = []
+
+            m = TAXON_RE.match(text)
+            if m:
+                genus, sp, ssp = m.group(1), m.group(2), m.group(3)
+                norm_species = f"{genus} {sp}"
+                if self._in_p9s or (ssp is not None and self._in_p9):
+                    # Subspecies row (usually p9s; also handle rare trinomial in p9)
+                    self.items.append(TaxonItem("subspecies", text))
+                else:
+                    # Species row
+                    self.items.append(TaxonItem("species", norm_species))
+                    if self._in_p9:
+                        self._last_species_in_p9 = norm_species
 
         if t == "i" and self._capture_common:
             common = " ".join("".join(self._common_buf).split())
-            if common and self._last_species_in_p:
-                self.species_common[self._last_species_in_p] = common
             self._capture_common = False
             self._common_buf = []
 
-        if t == "p" and self._in_species_p:
-            self._in_species_p = False
-            self._last_species_in_p = None
+            if common and self._last_species_in_p9:
+                self.species_common[self._last_species_in_p9] = common
+
+        if t == "p":
+            # Leaving paragraph blocks
+            if self._in_p9:
+                self._in_p9 = False
+                self._last_species_in_p9 = None
+            if self._in_p9s:
+                self._in_p9s = False
 
     def handle_data(self, data: str) -> None:
-        if self._capture_anchor_kind and data:
-            self._anchor_buf.append(data)
+        if self._capture_a and data:
+            self._a_buf.append(data)
         if self._capture_common and data:
             self._common_buf.append(data)
 
@@ -128,10 +154,8 @@ def subspecies_epithet_only(trinomial_text: str) -> str:
 
 def build_rows(items: List[TaxonItem], species_common: dict[str, str]) -> List[Tuple[str, str, str]]:
     """
-    Build rows enforcing:
-      - no species-only header rows
-      - if no subspecies exist for a species, output a single row with blank subspecies
-      - include common name (from the species row; carried to subspecies rows)
+    No species-only header rows.
+    If a species has no subspecies, output a single row with subspecies blank.
     """
     rows: List[Tuple[str, str, str]] = []
 
@@ -146,23 +170,21 @@ def build_rows(items: List[TaxonItem], species_common: dict[str, str]) -> List[T
 
     for it in items:
         if it.kind == "species":
-            # Species boundary: flush prior species if it never got a subspecies
             flush_blank_if_needed()
-
             current_species = normalize_species(it.taxon)
             current_common = species_common.get(current_species, "")
             current_species_had_subspecies = False
 
         elif it.kind == "subspecies":
-            # Edge case: subspecies before any species
+            # subspecies item carries full trinomial text; infer species from first two words
+            inferred_species = normalize_species(it.taxon)
             if not current_species:
-                current_species = normalize_species(it.taxon)
+                current_species = inferred_species
                 current_common = species_common.get(current_species, "")
 
             current_species_had_subspecies = True
             rows.append((current_species, subspecies_epithet_only(it.taxon), current_common))
 
-    # Flush last species if needed
     flush_blank_if_needed()
 
     # De-duplicate exact repeats while preserving order
@@ -175,6 +197,7 @@ def build_rows(items: List[TaxonItem], species_common: dict[str, str]) -> List[T
         deduped.append(r)
 
     return deduped
+
 
 def col_letter(n: int) -> str:
     s = ""
@@ -198,13 +221,12 @@ def write_xlsx(rows: List[Tuple[str, str, str]], out_path: str) -> None:
     sheet_rows_xml: List[str] = []
 
     # Header row
-    rnum = 1
-    header_cells = [
-        xlsx_cell_inline_str(cell_ref(1, rnum), "Species", 1),
-        xlsx_cell_inline_str(cell_ref(2, rnum), "Subspecies", 1),
-        xlsx_cell_inline_str(cell_ref(3, rnum), "Common Name", 1),
+    header = [
+        xlsx_cell_inline_str(cell_ref(1, 1), "Species", 1),
+        xlsx_cell_inline_str(cell_ref(2, 1), "Subspecies", 1),
+        xlsx_cell_inline_str(cell_ref(3, 1), "Common Name", 1),
     ]
-    sheet_rows_xml.append(f'<row r="{rnum}">{"".join(header_cells)}</row>')
+    sheet_rows_xml.append(f'<row r="1">{"".join(header)}</row>')
 
     # Data rows
     for i, (species, subspp, common) in enumerate(rows, start=2):
@@ -315,12 +337,12 @@ def main() -> int:
     parser.feed(html)
 
     if not parser.items:
-        print("No taxa anchors found. The page markup may have changed.", file=sys.stderr)
+        print("No taxa found. The page markup/pattern may have changed.", file=sys.stderr)
         return 2
 
     rows = build_rows(parser.items, parser.species_common)
     if not rows:
-        print("No rows produced after processing anchors.", file=sys.stderr)
+        print("No rows produced after processing taxa.", file=sys.stderr)
         return 2
 
     write_xlsx(rows, out_path)
